@@ -1,0 +1,422 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import errno
+import random
+import shutil
+import argparse
+from glob import glob
+import subprocess as sp
+import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from ConfigParser import ConfigParser
+
+
+class OnionEncryptor(object):
+    def __init__(self, config, args):
+        self.config = config
+        self.args = args
+        self.input_fname = args.input.name
+
+    def run(self):
+        args = self.args
+
+        if not args.output:
+            args.output = os.path.dirname(self.input_fname) or "."
+
+        output_is_encrypted = is_path_encrypted(args.output)
+        if output_is_encrypted is None:
+            print "WARNING: unable to determine whether output directory is secure."
+            print "         Be sure to securely delete it when you're done:"
+            print "             $ srm -r '%s'" %(args.output, )
+        elif not output_is_encrypted:
+            print "WARNING: output directory is not secure!"
+            print "         Unencrypted (or less-than-ideally-encrypted) temporary "
+            print "         files might be left on disk."
+            print "         Hint: use '%s --make-encrypted-workspace' to create "
+            print "         a securely encrypted disk image."
+            res = raw_input("Continue? [y/N]: ")
+            if res[:1] != "y":
+                print "Aborting."
+
+        self._tempdir_base, created = mkdir(args.output, "onioncrypt-work-tmp")
+        try:
+            if not created:
+                shutil.rmtree(self._tempdir_base)
+                mkdir(self._tempdir_base)
+            
+            self._passwords = {}
+            self.people = dict(
+                (name, dict(self.config.items(name)))
+                for name in self.config.sections()
+            )
+            for person in self.people:
+                pobj = self.people[person]
+                self.build_bundle(person, self._tempdir_base)
+                if "password-file" in pobj:
+                    print os.path.basename(pobj["password-file"])
+                print
+            for f in glob(os.path.join(self._tempdir_base, "*")):
+                target = os.path.join(args.output, os.path.basename(f))
+                if os.path.exists(target):
+                    os.unlink(target)
+                os.rename(f, target)
+        finally:
+            shutil.rmtree(self._tempdir_base)
+
+    def build_bundle(self, person, output_dir, previous_people=None, depth=None, indent=""):
+        """ Builds a bundle for ``person``, storing the result in ``output_dir``
+            and returning the bundle's filename. """
+
+        previous_people = previous_people or []
+        depth = depth or int(self.people[person]["depth"])
+        if depth == 1:
+            res = self.encrypt_file_to(
+                person,
+                self.input_fname,
+                os.path.join(output_dir, person),
+            )
+            print "%s%s" %(indent, os.path.basename(res))
+            return res
+
+        new_prev_people = previous_people + [person]
+
+        print "%s%s/" %(indent, person)
+        potential_targets = self.person_targets(person, previous_people)
+        if not potential_targets:
+            print "WARNING: Could not encrypt past %s: no valid people to encrypt to." %(
+                " -> ".join(new_prev_people),
+            )
+            return None
+
+        with self.tempdir(output_dir, person) as tempdir:
+            for target in potential_targets:
+                self.build_bundle(
+                    target, tempdir,
+                    previous_people=new_prev_people,
+                    depth=depth - 1,
+                    indent=indent + "| ",
+                )
+            zipfile = zip_directory(tempdir)
+            try:
+                res = self.encrypt_file_to(person, zipfile, zipfile)
+                print "%sv" %(indent, )
+                print "%s%s" %(indent, os.path.basename(res))
+                return res
+            finally:
+                os.unlink(zipfile)
+
+    def encrypt_file_to(self, person, input_fname, output_prefix):
+        """ Encrypts ``input_file`` to ``person``, saving it to
+            ``$output_prefix.ext``. """
+        output_fname = output_prefix + ".gpg"
+        pobj = self.people[person]
+        if "gen-password" in pobj:
+            password_file = self.person_get_password_file(person)
+            xsystem("gpg --symmetric --passphrase-file %s -o %s < %s" %(
+                shescape(password_file),
+                shescape(output_fname),
+                shescape(input_fname),
+            ), quiet=True)
+        elif "gpg-key" in pobj:
+            xsystem("gpg --encrypt --recipient %s -o %s < %s" %(
+                shescape(pobj["gpg-key"]),
+                shescape(output_fname),
+                shescape(input_fname),
+            ), quiet=True)
+        else:
+            print "ERROR: No encryption methods defined for %r " %(person, )
+            print "       (use either 'gen-password' or 'gpg-key')"
+            sys.exit(1)
+
+        return output_fname
+
+    def person_targets(self, person, previous):
+        return [p for p in self.people if p != person and p not in previous]
+
+    def person_get_password_file(self, person):
+        pobj = self.people[person]
+        if "password-file" not in pobj:
+            with open(os.path.join(self._tempdir_base, "%s-password.txt" %(person, )), "w") as f:
+                f.write(mkpassword())
+            pobj["password-file"] = f.name
+        return pobj["password-file"]
+
+    @contextmanager
+    def tempdir(self, *a):
+        dir, _ = mkdir(*a)
+        try:
+            yield dir
+        finally:
+            shutil.rmtree(dir)
+
+
+def zip_directory(path):
+    return shutil.make_archive(path, "zip", path, os.path.basename(path))
+
+_words = []
+def mkpassword():
+    if not _words:
+        _words.extend([
+            x.strip().lower() for x in open("/usr/share/dict/words")
+            if len(x) <= 8
+        ])
+
+        # TODO: 50000 and 100 are picked entirely arbitrarily with absolutely
+        # zero basis in any sort of math at all, whatsoever. This should be
+        # fixed.
+        if len(_words) < 50000:
+            print "WARNING: insufficient entropy!"
+            print           "/usr/share/dict/words only has %s words" %(len(_words), )
+
+    password = []
+    while len("-".join(password)) < 100:
+        password.append(random.choice(_words))
+    return "-".join(password)
+
+
+def mkdir(*parts):
+    dirname = os.path.join(*parts)
+    try:
+        os.mkdir(dirname)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+        return dirname, False
+    return dirname, True
+
+def shescape(s):
+    return "'" + s.replace("'", "\\'") + "'"
+
+def is_path_encrypted(d):
+    if sys.platform != "darwin":
+        return None
+
+    d = os.path.abspath(d)
+    mountpoints = plist2json(xsystem("diskutil list -plist", quiet=True))
+
+    best_match = ""
+    candidates = list(mountpoints["AllDisksAndPartitions"])
+    for disk in candidates:
+        if disk.get("Partitions"):
+            candidates.extend(disk["Partitions"])
+
+        mountpoint = disk.get("MountPoint")
+        if not mountpoint:
+            continue
+
+        if d.startswith(mountpoint) and len(mountpoint) > len(best_match):
+            best_match = mountpoint
+
+    mountpoint = best_match
+    if not mountpoint:
+        print "WARNING: Unable to determine the volume containing %r" %(d, )
+        return None
+
+    info = plist2json(xsystem("diskutil info -plist %s" %(shescape(mountpoint), ), quiet=True))
+    if "CoreStorageEncrypted" in info:
+        return info["CoreStorageEncrypted"]
+
+    if info.get("MediaName") == "disk image":
+        images = plist2json(xsystem("hdiutil info -plist", quiet=True))
+        for img in images["images"]:
+            if any(x.get("mount-point") == mountpoint for x in img.get("system-entities", [])):
+                break
+        else:
+            print "WARNING: Unable to determine disk image for %r" %(d, )
+            return None
+
+        return img.get("image-encrypted", False)
+
+    print "WARNING: Unknown disk MediaName: %r" %(info.get("MediaName"), )
+    return None
+
+def make_encrypted_workspace():
+    password = os.urandom(256).encode("base64").strip().replace("\n", "")
+    image_file = "/tmp/onioncrypt-workspace-%s.sparseimage" %(os.urandom(8).encode("hex"), )
+    xsystem(
+        "hdiutil create -encryption AES-256 -type SPARSE "
+        "-volname OnioncryptWorkspace -size 1gb -fs HFS+J "
+        "-stdinpass " + image_file,
+        stdin=password,
+    )
+    xsystem("hdiutil attach -encryption -stdinpass " + image_file, stdin=password)
+
+    res = xsystem("hdiutil info -plist", print_stdout=False)
+    mounted_images = plist2json(res)
+    for img in mounted_images["images"]:
+        if img["image-path"] == image_file:
+            break
+    else:
+        print "ERROR: Could not determine image mountpoint"
+        sys.exit(1)
+
+    mountpoints = [
+        x["mount-point"]
+        for x in img["system-entities"]
+        if "mount-point" in x
+    ]
+    if not mountpoints:
+        print "ERROR: Mountpoint not listed for new image"
+    mountpoint = mountpoints[0]
+    with open("%s/disk-image-password.txt" %(mountpoint, ), "w") as f:
+        f.write(password)
+
+    print
+    print "Encrypted image:"
+    print "          File:", image_file
+    print "      Password:", f.name
+    print "    Mountpoint:", mountpoint
+    print "Hint:"
+    print "    cd '%s'" %(mountpoint, )
+
+
+def xsystem(cmd, echo=True, stdin=None, print_stdout=True, quiet=False):
+    if quiet:
+        echo = False
+        print_stdout = False
+    if echo:
+        print cmd
+    proc = sp.Popen(cmd, shell=True, stdin=sp.PIPE, stdout=sp.PIPE)
+    if stdin is not None:
+        proc.stdin.write(stdin)
+        proc.stdin.close()
+    stdout = []
+    while proc.returncode is None:
+        chunk = proc.stdout.read(1024)
+        if not chunk:
+            break
+        if print_stdout:
+            sys.stdout.write(chunk)
+        stdout.append(chunk)
+    proc.wait()
+    if proc.returncode != 0:
+        print "ERROR: command failed with status %s" %(proc.returncode, )
+        if not echo:
+            print cmd
+        sys.exit(1)
+    return "".join(stdout)
+
+def plist2json(plist_bytes):
+    doc = ET.fromstring(plist_bytes)
+
+    def _plist2json(elem):
+        if elem.tag == "dict":
+            res = {}
+            children = iter(elem.getchildren())
+            for key in children:
+                res[key.text] = _plist2json(children.next())
+            return res
+
+        if elem.tag == "string":
+            return elem.text
+
+        if elem.tag == "array":
+            return map(_plist2json, elem.getchildren())
+
+        if elem.tag == "integer":
+            return int(elem.text)
+
+        if elem.tag == "data":
+            return elem.text.decode("base64")
+
+        if elem.tag == "true":
+            return True
+
+        if elem.tag == "false":
+            return False
+
+        raise AssertionError("Unexpected plist tag: %r" %(elem.tag, ))
+
+    return _plist2json(doc.getchildren()[0])
+
+
+
+sample_config = """
+; This example configuration will generate:
+; readme.txt
+; alex-password.txt
+; judy-password.txt
+; david.tar.gpg:
+;     readme.txt
+;     alex.tar.gpg: judy.tar.gpg, chris.tar.gpg
+; judy.tar.gpg:
+;     readme.txt
+;     alex.tar.gpg: chris.tar.gpg, alex.tar.gpg, david.tar.gpg
+; alex.tar.gpg
+;     readme.txt
+;     chris.tar.gpg: judy.tar.gpg, david.tar.gpg
+;     judy.tar.gpg: chris.tar.gpg
+;     david.tar.gpg: chris.tar.gpg
+; chris.tar.gpg
+;     readme.txt
+;     alex.tar.gpg: judy.tar.gpg, david.tar.gpg
+;     judy.tar.gpg: alex.tar.gpg
+;     david.tar.gpg: alex.tar.gpg
+
+[DEFAULT]
+depth: 3
+
+[david]
+email: david@wolever.net
+; A gpg key files should be encrypted to.
+gpg-key: b230230d
+; Files encrypted to david will never contain files encrypted to judy or
+; chris (although the files encrypted to david may contain judy or chris).
+; Exclusion is one direction. Both chris and judy may get files encrypted to
+; david.
+exclude: judy, chris
+
+[judy]
+email: judy@example.com
+; A password will be generated for judy and stored in 'judy-password.txt',
+; then files will be encrypted to that password.
+gen-password
+; Files encrypted to judy will only contain one file encrypted to alex.
+; Multiple names can be included, separated by a comma: alex, david
+include: alex
+
+[alex]
+gen-password
+
+[chris]
+gpg-key: abcd1234
+""".lstrip()
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write("error: %s\n" % message)
+        self.print_help()
+        sys.stderr.write("\nHINT: use --sample-config to show a sample config file.\n")
+        sys.exit(2)
+
+parser = ArgumentParser(description="Encrypt a file with multiple levels of encryption to multiple people.")
+
+parser.add_argument("config_file", type=argparse.FileType("r"))
+parser.add_argument("input", type=argparse.FileType("r"))
+parser.add_argument("output", nargs="?", default=None)
+parser.add_argument("-c", "--sample-config", action="store_true", help="Print a sample config file.")
+parser.add_argument("-m", "--make-encrypted-workspace", action="store_true", help="""
+    Create and mount an encrypted disk image which can be used as a temporary
+    workspace to reduce the risk of leaving unencrypted data on disk (OS X
+    only).
+""")
+
+
+if "--sample-config" in sys.argv or "-c" in sys.argv:
+    print sample_config
+    sys.exit(0)
+
+
+if "--make-encrypted-workspace" in sys.argv or "-m" in sys.argv:
+    make_encrypted_workspace()
+    sys.exit(0)
+
+args = parser.parse_args()
+
+config = ConfigParser(allow_no_value=True)
+config.read(args.config_file.name)
+
+sys.exit(OnionEncryptor(config, args).run())
