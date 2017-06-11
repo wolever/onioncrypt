@@ -7,9 +7,9 @@ import random
 import shutil
 import zipfile
 import hashlib
+import textwrap
 import argparse
 import subprocess as sp
-from textwrap import dedent
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from ConfigParser import ConfigParser
@@ -110,6 +110,9 @@ class OnionEncryptor(object):
                 self.build_bundle(person, output_dir)
                 if person.has_password():
                     print os.path.basename(person.get_password_file_path())
+                with open(pjoin(output_dir, "%s-README.txt" %(person, )), "w") as f:
+                    self.write_readme_generic(f)
+                print os.path.basename(f.name)
                 print
             for f in os.listdir(output_dir):
                 f = pjoin(output_dir, f)
@@ -249,8 +252,8 @@ class OnionEncryptor(object):
 
     def write_readme_for_targets(self, fobj, person, target_people, depth):
         fobj.write(dedent("""
-            Decryption Instructions
-            =======================
+            Bundle Information
+            ==================
 
             This is encrypted layer %s of %s. To decrypt the next layer,
             contact any of the following people and securely (preferrably via
@@ -266,6 +269,42 @@ class OnionEncryptor(object):
             person["depth"],
             "\n\n".join(p.get_contact_str() for p in target_people)
         ))
+
+        fobj.write("\n\n")
+        self.write_readme_generic(fobj)
+
+    def write_readme_generic(self, fobj):
+        fobj.write(dedent("""
+            Decryption Instructions
+            =======================
+
+            Decrypting 'gpg' Files
+            ----------------------
+
+            To decrypt files with the 'gpg' extension, run:
+
+                $ gpg file.gpg
+
+            And if the password is stored in a file, use:
+
+                $ gpg --passphrase-file your-password.txt file.gpg
+
+            (Note: the file *should not* have a newline at the end)
+
+            gpg can be downloaded from: https://www.gnupg.org/
+
+
+            Decrypting 'dmg' Files
+            ----------------------
+
+            To decrypt files with the 'dmg' extension, either double click the
+            file, or run:
+
+                $ hdiutil attach -stdinpass file.dmg
+
+            Note: a computer running OS X is required to decrypt 'dmg' files.
+        """))
+
 
 
 def zip_directory(path, output_dir=None):
@@ -318,6 +357,9 @@ def mkdir(*parts):
 
 pjoin = os.path.join
 splitext = os.path.splitext
+
+def dedent(s):
+    return textwrap.dedent(s.lstrip("\n"))
 
 def shescape(s):
     return "'" + to_str(s).replace("'", "\\'") + "'"
@@ -516,11 +558,13 @@ sample_config = """
 ;     david.zip.gpg: alex.zip.gpg
 
 [DEFAULT]
+; The number of levels of encryption (ie, layers in the onion)
 depth: 3
 
 [david]
 ; A gpg key files should be encrypted to.
 gpg-key: b230230d
+
 ; Files encrypted to david will never contain files encrypted to judy or
 ; chris (although the files encrypted to david may contain judy or chris).
 ; Exclusion is one direction. Both chris and judy may get files encrypted to
@@ -528,7 +572,7 @@ gpg-key: b230230d
 exclude: judy, chris
 
 ; Contact information, for the README.txt file which will appear in each
-; encrypted bundle. It may be partially (or fully) omitted.
+; encrypted bundle.
 email: david@wolever.net
 full-name: David Wolever
 ; The contact-info field will be incldued verbatim
@@ -538,15 +582,14 @@ contact-info:
     123 Fake St
     Toronto, ON
 
-
 [judy]
 ; A password will be generated for judy and stored in 'judy-password.txt',
 ; then files will be stored in a disk image encrypted with that password.
 enc-method=dmg-symmetric
+
 ; Files encrypted to judy will only contain one file encrypted to alex.
 ; Multiple names can be included, separated by a comma: alex, david
 include: alex
-email: judy@example.com
 
 [alex]
 ; A password will be generated for alex and stored in 'alex-password.txt',
