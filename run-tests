@@ -1,0 +1,73 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import shutil
+import tempfile
+import subprocess as sp
+
+
+def xsystem(cmd, echo=True, stdin=None, print_stdout=True, quiet=False):
+    if quiet:
+        echo = False
+        print_stdout = False
+    if echo:
+        print cmd
+    proc = sp.Popen(cmd, shell=True, stdin=sp.PIPE, stdout=sp.PIPE)
+    if stdin is not None:
+        proc.stdin.write(stdin)
+        proc.stdin.close()
+    stdout = []
+    while proc.returncode is None:
+        chunk = proc.stdout.read(1)
+        if not chunk:
+            break
+        if print_stdout:
+            sys.stdout.write(chunk)
+        stdout.append(chunk)
+    proc.wait()
+    if proc.returncode != 0:
+        print "ERROR: command failed with status %s" %(proc.returncode, )
+        if not echo:
+            print cmd
+        sys.exit(1)
+    return "".join(stdout)
+
+
+resume = "--resume" in sys.argv
+if resume:
+    _workdir = sys.argv[sys.argv.index("--resume") + 1]
+else:
+    _workdir = tempfile.mkdtemp(prefix="onioncrypt-test")
+
+workdir = lambda *a: os.path.join(_workdir, *a)
+
+print "Working directory:", workdir()
+
+if not resume:
+    config_file = workdir("config.ini")
+    xsystem("onioncrypt -c > %s" %(config_file, ))
+
+    with open(workdir("secret.txt"), "w") as secret_file:
+        secret_file.write("Secret correctly decrypted!\n\n")
+
+    xsystem("./onioncrypt --no-warnings %s %s %s" %(
+        config_file,
+        secret_file.name,
+        workdir(),
+    ))
+
+judy_password = open(workdir("judy-password.txt")).read()
+
+print "Verifying output..."
+try:
+    os.chdir(workdir())
+    xsystem("hdiutil attach -stdinpass judy.dmg", stdin=judy_password)
+    shutil.copy("/Volumes/judy/chris.zip", "chris-from-judy.zip")
+    xsystem("unzip -o chris-from-judy.zip")
+    xsystem("gpg --batch --yes --passphrase-file alex-password.txt chris/alex.txt.gpg")
+    xsystem("cat chris/alex.txt")
+finally:
+    xsystem("umount /Volumes/judy")
+if not resume:
+    shutil.rmtree(workdir())

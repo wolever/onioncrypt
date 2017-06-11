@@ -75,20 +75,21 @@ class OnionEncryptor(object):
         if not args.output:
             args.output = os.path.dirname(self.input_fname) or "."
 
-        output_is_encrypted = is_path_encrypted(args.output)
-        if output_is_encrypted is None:
-            print "WARNING: unable to determine whether output directory is secure."
-            print "         Be sure to securely delete it when you're done:"
-            print "             $ srm -r '%s'" %(args.output, )
-        elif not output_is_encrypted:
-            print "WARNING: output directory is not secure!"
-            print "         Unencrypted (or less-than-ideally-encrypted) temporary "
-            print "         files might be left on disk."
-            print "         Hint: use '%s --make-encrypted-workspace' to create "
-            print "         a securely encrypted disk image."
-            res = raw_input("Continue? [y/N]: ")
-            if res[:1] != "y":
-                print "Aborting."
+        if args.show_warnings:
+            output_is_encrypted = is_path_encrypted(args.output)
+            if output_is_encrypted is None:
+                print "WARNING: unable to determine whether output directory is secure."
+                print "         Be sure to securely delete it when you're done:"
+                print "             $ srm -r '%s'" %(args.output, )
+            elif not output_is_encrypted:
+                print "WARNING: output directory is not secure!"
+                print "         Unencrypted (or less-than-ideally-encrypted) temporary "
+                print "         files might be left on disk."
+                print "         Hint: use '%s --make-encrypted-workspace' to create "
+                print "         a securely encrypted disk image."
+                res = raw_input("Continue? [y/N]: ")
+                if res[:1] != "y":
+                    print "Aborting."
 
         mkdir(args.output)
         self._tempdir_base, created = mkdir(args.output, "onioncrypt-work-tmp")
@@ -104,6 +105,8 @@ class OnionEncryptor(object):
             output_dir, _ = mkdir(self._tempdir_base, "output")
             for person in self.people:
                 person.set_password_file_prefix(output_dir)
+
+            for person in self.people:
                 self.build_bundle(person, output_dir)
                 if person.has_password():
                     print os.path.basename(person.get_password_file_path())
@@ -155,6 +158,7 @@ class OnionEncryptor(object):
             res = self.encrypt_file_to(person, tempdir, tempdir)
             print "%sv" %(indent, )
             print "%s%s" %(indent, os.path.basename(res))
+            sys.stdout.flush()
             return res
 
     def encrypt_file_to(self, person, input_path, output_prefix):
@@ -496,16 +500,16 @@ sample_config = """
 ; judy-password.txt
 ; david.zip.gpg:
 ;     README.txt
-;     alex.zip.gpg: judy.dmg, chris.zip.gpg
+;     alex.zip.gpg: judy.dmg, chris.zip
 ; judy.zip.dmg:
 ;     README.txt
-;     alex.zip.gpg: chris.zip.gpg, alex.zip.gpg, david.zip.gpg
+;     alex.zip.gpg: chris.zip, alex.zip.gpg, david.zip.gpg
 ; alex.zip.gpg
 ;     README.txt
-;     chris.zip.gpg: judy.dmg, david.zip.gpg
-;     judy.dmg: chris.zip.gpg
-;     david.zip.gpg: chris.zip.gpg
-; chris.zip.gpg
+;     chris.zip: judy.dmg, david.zip.gpg
+;     judy.dmg: chris.zip
+;     david.zip.gpg: chris.zip
+; chris.zip
 ;     README.txt
 ;     alex.zip.gpg: judy.dmg, david.zip.gpg
 ;     judy.dmg: alex.zip.gpg
@@ -547,10 +551,12 @@ email: judy@example.com
 [alex]
 ; A password will be generated for alex and stored in 'alex-password.txt',
 ; then files will be stored in a zip file encrypted with 'gpg --symmetric'.
-enc-method=gpg-symmetric
+enc-method: gpg-symmetric
 
 [chris]
-gpg-key: abcd1234
+; The UNSAFE-zip encryption method simply the input into a zip file. It goes
+; without saying that this method isn't safe.
+enc-method: UNSAFE-zip
 """.lstrip()
 
 
@@ -566,6 +572,13 @@ parser = ArgumentParser(description="Encrypt a file with multiple levels of encr
 parser.add_argument("config_file", type=argparse.FileType("r"))
 parser.add_argument("input", type=argparse.FileType("r"))
 parser.add_argument("output", nargs="?", default=None)
+parser.add_argument(
+    "-W", "--no-warnings",
+    action="store_false",
+    dest="show_warnings",
+    default=True,
+    help="Don't show unsafe working directory warnings.",
+)
 parser.add_argument("-c", "--sample-config", action="store_true", help="Print a sample config file.")
 parser.add_argument("-m", "--make-encrypted-workspace", action="store_true", help="""
     Create and mount an encrypted disk image which can be used as a temporary
