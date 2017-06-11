@@ -9,17 +9,19 @@ import zipfile
 import hashlib
 import textwrap
 import argparse
+from glob import glob
 import subprocess as sp
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from ConfigParser import ConfigParser
-
 
 class Person(dict):
     def __init__(self, name, obj):
         self.update(obj)
         self["depth"] = int(self.get("depth", 3))
         self["name"] = name
+        self["include"] = splitlist(self.get("include", ""))
+        self["exclude"] = splitlist(self.get("exclude", ""))
 
     def has_password(self):
         return os.path.exists(self.get_password_file_path())
@@ -102,9 +104,11 @@ class OnionEncryptor(object):
                 Person(name, dict(self.config.items(name)))
                 for name in self.config.sections()
             ]
+            self.person_by_name = {}
             output_dir, _ = mkdir(self._tempdir_base, "output")
             for person in self.people:
                 person.set_password_file_prefix(output_dir)
+                self.person_by_name[person["name"]] = person
 
             for person in self.people:
                 self.build_bundle(person, output_dir)
@@ -156,10 +160,12 @@ class OnionEncryptor(object):
                     depth=depth - 1,
                     indent=indent + "| ",
                 )
-            with open(pjoin(tempdir, "README.txt"), "w") as f:
-                self.write_readme_for_targets(f, person, potential_targets, depth)
             res = self.encrypt_file_to(person, tempdir, tempdir)
             print "%sv" %(indent, )
+            if depth < person["depth"]:
+                with open(pjoin(tempdir, "README.txt"), "w") as f:
+                    self.write_readme_for_targets(f, person, potential_targets, depth)
+                    print "%s%s" %(indent, os.path.basename(f.name))
             print "%s%s" %(indent, os.path.basename(res))
             sys.stdout.flush()
             return res
@@ -167,6 +173,24 @@ class OnionEncryptor(object):
     def encrypt_file_to(self, person, input_path, output_prefix):
         """ Encrypts ``input_file`` to ``person``, saving it to
             ``$output_prefix.ext``. """
+        encrypted_file = self._encrypt_file_to(person, input_path)
+        output_fname = (
+            output_prefix +
+            os.path.basename(encrypted_file).replace("__output__", "")
+        )
+        os.link(encrypted_file, output_fname)
+        return output_fname
+
+    def _encrypt_file_to(self, person, input_path):
+        output_dir, created = mkdir(
+            self._tempdir_base,
+            "encrypted-files",
+            sha256(input_path),
+            person["name"],
+        )
+        if not created:
+            return glob(pjoin(output_dir, "__output__*"))[0]
+        output_prefix = pjoin(output_dir, "__output__")
 
         encryption_method = person.get_encryption_method()
         if encryption_method == "gpg-symmetric":
@@ -206,7 +230,6 @@ class OnionEncryptor(object):
             input_fname = self.require_file(input_path)
             output_fname = output_prefix + splitext(input_fname)[1]
             shutil.copy(input_fname, output_fname)
-
         else:
             print "ERROR: Invalid encryption method for %s: %s." %(person, encryption_method)
             print "       Use either 'gpg-key=...' or 'enc-method=...' with 'gpg-symmetric' or 'dmg-symmetric')"
@@ -215,7 +238,15 @@ class OnionEncryptor(object):
         return output_fname
 
     def person_targets(self, person, previous):
-        return [p for p in self.people if p != person and p not in previous]
+        candidates = self.people
+        if person["include"]:
+            candidates = [self.person_by_name[p] for p in person["include"]]
+
+        exclude = previous + [self.person_by_name[p] for p in person["exclude"]]
+        return [
+            p for p in candidates
+            if p != person and p not in exclude
+        ]
 
     @contextmanager
     def tempdir(self, *a):
@@ -366,6 +397,12 @@ def shescape(s):
 
 def sha256(s):
     return hashlib.sha256(s).hexdigest()
+
+def splitlist(x):
+    return [
+        y.strip() for y in x.split(",")
+        if y.strip()
+    ]
 
 def is_path_encrypted(d):
     if sys.platform != "darwin":
@@ -534,7 +571,6 @@ def to_str(obj, encoding="utf-8", **encode_args):
     return str(obj)
 
 
-
 sample_config = """
 ; This example configuration will generate:
 ; readme.txt
@@ -543,9 +579,11 @@ sample_config = """
 ; david.zip.gpg:
 ;     README.txt
 ;     alex.zip.gpg: judy.dmg, chris.zip
-; judy.zip.dmg:
+;     chris.zip: judy.dmg, alex.zip.gpg
+; judy.dmg:
 ;     README.txt
-;     alex.zip.gpg: chris.zip, alex.zip.gpg, david.zip.gpg
+;     alex.zip.gpg: chris.zip
+;     chris.zip: alex.zip.gpg
 ; alex.zip.gpg
 ;     README.txt
 ;     chris.zip: judy.dmg, david.zip.gpg
@@ -565,11 +603,10 @@ depth: 3
 ; A gpg key files should be encrypted to.
 gpg-key: b230230d
 
-; Files encrypted to david will never contain files encrypted to judy or
-; chris (although the files encrypted to david may contain judy or chris).
-; Exclusion is one direction. Both chris and judy may get files encrypted to
-; david.
-exclude: judy, chris
+; Files encrypted to david will never contain files encrypted to judy
+; (although the files encrypted to david may contain judy).
+; Exclusion is one direction. judy may get files encrypted to david.
+exclude: judy
 
 ; Contact information, for the README.txt file which will appear in each
 ; encrypted bundle.
@@ -587,9 +624,8 @@ contact-info:
 ; then files will be stored in a disk image encrypted with that password.
 enc-method=dmg-symmetric
 
-; Files encrypted to judy will only contain one file encrypted to alex.
-; Multiple names can be included, separated by a comma: alex, david
-include: alex
+; Files encrypted to judy will only contain files encrypted to chris and alex.
+include: chris, alex
 
 [alex]
 ; A password will be generated for alex and stored in 'alex-password.txt',
