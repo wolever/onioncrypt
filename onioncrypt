@@ -6,11 +6,61 @@ import errno
 import random
 import shutil
 import zipfile
+import hashlib
 import argparse
 import subprocess as sp
+from textwrap import dedent
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from ConfigParser import ConfigParser
+
+
+class Person(dict):
+    def __init__(self, name, obj):
+        self.update(obj)
+        self["depth"] = int(self.get("depth", 3))
+        self["name"] = name
+
+    def has_password(self):
+        return os.path.exists(self.get_password_file_path())
+
+    def set_password_file_prefix(self, prefix):
+        self._password_file_prefix = prefix
+
+    def get_password_file_path(self):
+        return pjoin(
+            self._password_file_prefix,
+            "%s-password.txt" %(self, ),
+        )
+
+    def get_or_create_password_file(self):
+        path = self.get_password_file_path()
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(mkpassword())
+        return path
+
+    def get_encryption_method(self):
+        if "gpg-key" in self:
+            return "gpg-key"
+        return self.get("enc-method", "gpg-symmetric")
+
+    def get_contact_str(self):
+        bits = filter(None, [
+            self.get("full-name"),
+            self.get("email"),
+            self.get("contact-info"),
+        ])
+        if not bits:
+            bits.append("No contact information provided.")
+        return "%s\n%s\n%s" %(
+            self["name"],
+            "-" * len(self["name"]),
+            "\n".join(bits),
+        )
+
+    def __str__(self):
+        return self["name"]
 
 
 class OnionEncryptor(object):
@@ -47,20 +97,20 @@ class OnionEncryptor(object):
                 shutil.rmtree(self._tempdir_base)
                 mkdir(self._tempdir_base)
             
-            self._passwords = {}
-            self.people = dict(
-                (name, dict(self.config.items(name)))
+            self.people = [
+                Person(name, dict(self.config.items(name)))
                 for name in self.config.sections()
-            )
+            ]
+            output_dir, _ = mkdir(self._tempdir_base, "output")
             for person in self.people:
-                pobj = self.people[person]
-                self.build_bundle(person, self._tempdir_base)
-                if "password-file" in pobj:
-                    print os.path.basename(pobj["password-file"])
+                person.set_password_file_prefix(output_dir)
+                self.build_bundle(person, output_dir)
+                if person.has_password():
+                    print os.path.basename(person.get_password_file_path())
                 print
-            for f in os.listdir(self._tempdir_base):
-                f = os.path.join(self._tempdir_base, f)
-                target = os.path.join(args.output, os.path.basename(f))
+            for f in os.listdir(output_dir):
+                f = pjoin(output_dir, f)
+                target = pjoin(args.output, os.path.basename(f))
                 if os.path.exists(target):
                     os.unlink(target)
                 os.rename(f, target)
@@ -72,12 +122,12 @@ class OnionEncryptor(object):
             and returning the bundle's filename. """
 
         previous_people = previous_people or []
-        depth = depth or int(self.people[person]["depth"])
+        depth = depth or person["depth"]
         if depth == 1:
             res = self.encrypt_file_to(
                 person,
                 self.input_fname,
-                os.path.join(output_dir, person),
+                pjoin(output_dir, person["name"]),
             )
             print "%s%s" %(indent, os.path.basename(res))
             return res
@@ -88,11 +138,11 @@ class OnionEncryptor(object):
         potential_targets = self.person_targets(person, previous_people)
         if not potential_targets:
             print "WARNING: Could not encrypt past %s: no valid people to encrypt to." %(
-                " -> ".join(new_prev_people),
+                " -> ".join(map(str, new_prev_people)),
             )
             return None
 
-        with self.tempdir(output_dir, person) as tempdir:
+        with self.tempdir(output_dir, person["name"]) as tempdir:
             for target in potential_targets:
                 self.build_bundle(
                     target, tempdir,
@@ -100,50 +150,65 @@ class OnionEncryptor(object):
                     depth=depth - 1,
                     indent=indent + "| ",
                 )
-            zipfile = zip_directory(tempdir)
-            try:
-                res = self.encrypt_file_to(person, zipfile, zipfile)
-                print "%sv" %(indent, )
-                print "%s%s" %(indent, os.path.basename(res))
-                return res
-            finally:
-                os.unlink(zipfile)
+            with open(pjoin(tempdir, "README.txt"), "w") as f:
+                self.write_readme_for_targets(f, person, potential_targets, depth)
+            res = self.encrypt_file_to(person, tempdir, tempdir)
+            print "%sv" %(indent, )
+            print "%s%s" %(indent, os.path.basename(res))
+            return res
 
-    def encrypt_file_to(self, person, input_fname, output_prefix):
+    def encrypt_file_to(self, person, input_path, output_prefix):
         """ Encrypts ``input_file`` to ``person``, saving it to
             ``$output_prefix.ext``. """
-        output_fname = output_prefix + ".gpg"
-        pobj = self.people[person]
-        if "gen-password" in pobj:
-            password_file = self.person_get_password_file(person)
+
+        encryption_method = person.get_encryption_method()
+        if encryption_method == "gpg-symmetric":
+            input_fname = self.require_file(input_path)
+            output_fname = output_prefix + splitext(input_fname)[1] + ".gpg"
             xsystem("gpg --symmetric --cipher-algo AES256 --passphrase-file %s -o %s < %s" %(
-                shescape(password_file),
+                shescape(person.get_or_create_password_file()),
                 shescape(output_fname),
                 shescape(input_fname),
             ), quiet=True)
-        elif "gpg-key" in pobj:
+
+        elif encryption_method == "gpg-key":
+            input_fname = self.require_file(input_path)
+            output_fname = output_prefix + splitext(input_fname)[1] + ".gpg"
             xsystem("gpg --encrypt --recipient %s -o %s < %s" %(
-                shescape(pobj["gpg-key"]),
+                shescape(person["gpg-key"]),
                 shescape(output_fname),
                 shescape(input_fname),
             ), quiet=True)
+
+        elif encryption_method == "dmg-symmetric":
+            input_dir = self.require_directory(input_path)
+            output_fname = output_prefix + ".dmg"
+            xsystem(
+                "hdiutil create -encryption AES-256 "
+                "-volname %s -fs HFS+J -stdinpass "
+                "-srcfolder %s %s" %(
+                    shescape(person["name"]),
+                    shescape(input_dir),
+                    shescape(output_fname),
+                ),
+                stdin=open(person.get_or_create_password_file()).read(),
+                quiet=True,
+            )
+
+        elif encryption_method == "UNSAFE-zip":
+            input_fname = self.require_file(input_path)
+            output_fname = output_prefix + splitext(input_fname)[1]
+            shutil.copy(input_fname, output_fname)
+
         else:
-            print "ERROR: No encryption methods defined for %r " %(person, )
-            print "       (use either 'gen-password' or 'gpg-key')"
+            print "ERROR: Invalid encryption method for %s: %s." %(person, encryption_method)
+            print "       Use either 'gpg-key=...' or 'enc-method=...' with 'gpg-symmetric' or 'dmg-symmetric')"
             sys.exit(1)
 
         return output_fname
 
     def person_targets(self, person, previous):
         return [p for p in self.people if p != person and p not in previous]
-
-    def person_get_password_file(self, person):
-        pobj = self.people[person]
-        if "password-file" not in pobj:
-            with open(os.path.join(self._tempdir_base, "%s-password.txt" %(person, )), "w") as f:
-                f.write(mkpassword())
-            pobj["password-file"] = f.name
-        return pobj["password-file"]
 
     @contextmanager
     def tempdir(self, *a):
@@ -153,16 +218,68 @@ class OnionEncryptor(object):
         finally:
             shutil.rmtree(dir)
 
+    def require_file(self, path):
+        if not os.path.isdir(path):
+            return path
+        output_prefix, _ = mkdir(
+            self._tempdir_base,
+            "required-files",
+            sha256(path),
+        )
+        return zip_directory(path, output_prefix)
 
-def zip_directory(path):
+    def require_directory(self, path):
+        if os.path.isdir(path):
+            return path
+
+        output_dir, created = mkdir(
+            self._tempdir_base,
+            "required-directories",
+            sha256(path),
+            splitext(os.path.basename(path))[0],
+        )
+        if not created:
+            return output_dir
+        shutil.copy(path, output_dir)
+        return output_dir
+
+    def write_readme_for_targets(self, fobj, person, target_people, depth):
+        fobj.write(dedent("""
+            Decryption Instructions
+            =======================
+
+            This is encrypted layer %s of %s. To decrypt the next layer,
+            contact any of the following people and securely (preferrably via
+            USB key, encrypted chat such as Signal or iMessage, or local
+            network; email should not be used unless absolutely necessary) send
+            them the appropriate file, which they will be able to decrypt.
+
+            Contact information:
+
+            %s
+        """) %(
+            person["depth"] - depth + 1,
+            person["depth"],
+            "\n\n".join(p.get_contact_str() for p in target_people)
+        ))
+
+
+def zip_directory(path, output_dir=None):
+    basename = os.path.basename(path)
+    output_dir = output_dir or os.path.dirname(path)
+
+    zipfile_name = pjoin(output_dir, basename + ".zip")
+    if os.path.exists(zipfile_name):
+        return zipfile_name
+
     files = os.listdir(path)
     if not files:
         print "WARNING: trying to zip an empty directory:", path
-    prefix = os.path.basename(path) if len(files) > 1 else ""
-    zipfile_name = path + ".zip"
+    content_prefix = basename if len(files) > 1 else ""
+
     with zipfile.ZipFile(zipfile_name, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
-            zf.write(os.path.join(path, f), arcname=os.path.join(prefix, f))
+            zf.write(pjoin(path, f), arcname=pjoin(content_prefix, f))
     return zipfile_name
 
 _words = []
@@ -185,19 +302,24 @@ def mkpassword():
         password.append(random.choice(_words))
     return "-".join(password)
 
-
 def mkdir(*parts):
-    dirname = os.path.join(*parts)
+    dirname = pjoin(*parts)
     try:
-        os.mkdir(dirname)
+        os.makedirs(dirname)
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
         return dirname, False
     return dirname, True
 
+pjoin = os.path.join
+splitext = os.path.splitext
+
 def shescape(s):
-    return "'" + s.replace("'", "\\'") + "'"
+    return "'" + to_str(s).replace("'", "\\'") + "'"
+
+def sha256(s):
+    return hashlib.sha256(s).hexdigest()
 
 def is_path_encrypted(d):
     if sys.platform != "darwin":
@@ -342,34 +464,57 @@ def plist2json(plist_bytes):
     return _plist2json(doc.getchildren()[0])
 
 
+def to_str(obj, encoding="utf-8", **encode_args):
+    """
+    Returns a ``str`` of ``obj``, encoding using ``encoding`` if necessary. For
+    example::
+        >>> some_str = b"\xff"
+        >>> some_unicode = u"\u1234"
+        >>> some_exception = Exception(u'Error: ' + some_unicode)
+        >>> r(to_str(some_str))
+        b'\xff'
+        >>> r(to_str(some_unicode))
+        b'\xe1\x88\xb4'
+        >>> r(to_str(some_exception))
+        b'Error: \xe1\x88\xb4'
+        >>> r(to_str([42]))
+        b'[42]'
+    See source code for detailed semantics.
+    """
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, unicode) or hasattr(obj, "__unicode__"):
+        return unicode(obj).encode(encoding, **encode_args)
+    return str(obj)
+
+
 
 sample_config = """
 ; This example configuration will generate:
 ; readme.txt
 ; alex-password.txt
 ; judy-password.txt
-; david.tar.gpg:
-;     readme.txt
-;     alex.tar.gpg: judy.tar.gpg, chris.tar.gpg
-; judy.tar.gpg:
-;     readme.txt
-;     alex.tar.gpg: chris.tar.gpg, alex.tar.gpg, david.tar.gpg
-; alex.tar.gpg
-;     readme.txt
-;     chris.tar.gpg: judy.tar.gpg, david.tar.gpg
-;     judy.tar.gpg: chris.tar.gpg
-;     david.tar.gpg: chris.tar.gpg
-; chris.tar.gpg
-;     readme.txt
-;     alex.tar.gpg: judy.tar.gpg, david.tar.gpg
-;     judy.tar.gpg: alex.tar.gpg
-;     david.tar.gpg: alex.tar.gpg
+; david.zip.gpg:
+;     README.txt
+;     alex.zip.gpg: judy.dmg, chris.zip.gpg
+; judy.zip.dmg:
+;     README.txt
+;     alex.zip.gpg: chris.zip.gpg, alex.zip.gpg, david.zip.gpg
+; alex.zip.gpg
+;     README.txt
+;     chris.zip.gpg: judy.dmg, david.zip.gpg
+;     judy.dmg: chris.zip.gpg
+;     david.zip.gpg: chris.zip.gpg
+; chris.zip.gpg
+;     README.txt
+;     alex.zip.gpg: judy.dmg, david.zip.gpg
+;     judy.dmg: alex.zip.gpg
+;     david.zip.gpg: alex.zip.gpg
 
 [DEFAULT]
 depth: 3
 
 [david]
-email: david@wolever.net
 ; A gpg key files should be encrypted to.
 gpg-key: b230230d
 ; Files encrypted to david will never contain files encrypted to judy or
@@ -378,17 +523,31 @@ gpg-key: b230230d
 ; david.
 exclude: judy, chris
 
+; Contact information, for the README.txt file which will appear in each
+; encrypted bundle. It may be partially (or fully) omitted.
+email: david@wolever.net
+full-name: David Wolever
+; The contact-info field will be incldued verbatim
+contact-info:
+    Home phone: 416 555 1234
+    Cell phone: 416 555 4321
+    123 Fake St
+    Toronto, ON
+
+
 [judy]
-email: judy@example.com
 ; A password will be generated for judy and stored in 'judy-password.txt',
-; then files will be encrypted to that password.
-gen-password
+; then files will be stored in a disk image encrypted with that password.
+enc-method=dmg-symmetric
 ; Files encrypted to judy will only contain one file encrypted to alex.
 ; Multiple names can be included, separated by a comma: alex, david
 include: alex
+email: judy@example.com
 
 [alex]
-gen-password
+; A password will be generated for alex and stored in 'alex-password.txt',
+; then files will be stored in a zip file encrypted with 'gpg --symmetric'.
+enc-method=gpg-symmetric
 
 [chris]
 gpg-key: abcd1234
