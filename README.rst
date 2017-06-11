@@ -16,6 +16,13 @@ encrypting the file to each person, then encrypting the result to each other
 person, and so on.
 
 
+BETA WARNING
+------------
+
+**NOTE**: ``onioncrypt`` should still be considered beta quality, as it has not
+been throughly or adiquitely reviewed.
+
+
 Installation
 ------------
 
